@@ -1,0 +1,1432 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+tgu — удобный CLI-клиент Telegram (Termux/Linux) на базе Telethon.
+
+Первый запуск:  tgu login
+Дальше:         tgu chats, tgu read, tgu send, tgu push, tgu pull, ...
+Справка:        tgu help [команда]
+"""
+
+import argparse
+import asyncio
+import datetime as dt
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+from telethon import TelegramClient, __version__ as telethon_version
+from telethon.errors import FloodError, RPCError
+from telethon.tl import types as tl
+from telethon.tl.custom import Message
+from telethon.tl.functions.channels import GetFullChannelRequest
+from telethon.tl.functions.users import GetFullUserRequest
+from telethon.tl.types import (
+    InputMessagesFilterPhotos,
+    InputMessagesFilterVideo,
+    InputMessagesFilterDocument,
+    InputMessagesFilterVoice,
+    InputMessagesFilterMusic,
+    InputMessagesFilterGif,
+    InputMessagesFilterRoundVideo,
+    InputMessagesFilterUrl,
+)
+
+PROG = "tgu"
+VERSION = "1.0.1"
+
+HOME = Path.home()
+CFG_DIR = Path(os.environ.get("TGU_HOME", str(HOME / ".config" / "tgu")))
+SESSION_FILE = CFG_DIR / "session"          # telethon допишет .session
+SESSION_DB = CFG_DIR / "session.session"    # реальный файл сессии
+CONFIG_FILE = CFG_DIR / "config.json"
+DEFAULT_DL_DIR = HOME / "tgu-downloads"
+
+T_LINK = re.compile(r"(?:https?://)?t\.me/(?:joinchat/|\+)?([A-Za-z0-9_-]{3,64})")
+T_INT = re.compile(r"-?\d+")
+
+
+# ───────────────────────────── colors / output ─────────────────────────────
+
+def _on():
+    return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def _c(code, s):
+    return s if not _on() else "\033[%sm%s\033[0m" % (code, s)
+
+
+def bold(s):  return _c("1", str(s))
+def dim(s):   return _c("2", str(s))
+def cyan(s):  return _c("36", str(s))
+def green(s): return _c("32", str(s))
+def yellow(s): return _c("33", str(s))
+def red(s):   return _c("31", str(s))
+
+
+def die(msg, code=1):
+    print(red("ошибка: ") + str(msg), file=sys.stderr)
+    sys.exit(code)
+
+
+def warn(msg):
+    print(yellow("предупреждение: ") + str(msg), file=sys.stderr)
+
+
+def human(n):
+    n = float(n or 0)
+    for u in ("Б", "КиБ", "МиБ", "ГиБ"):
+        if n < 1024 or u == "ГиБ":
+            return ("%.1f %s" % (n, u)).replace(".0 ", " ")
+        n /= 1024
+
+
+def local(d):
+    return dt.datetime.fromtimestamp(d.timestamp()) if d else None
+
+
+def fdate(d):
+    d = local(d)
+    if not d:
+        return "-"
+    if d.date() == dt.date.today():
+        return d.strftime("%H:%M:%S")
+    if d.year == dt.datetime.now().year:
+        return d.strftime("%d.%m %H:%M:%S")
+    return d.strftime("%d.%m.%y %H:%M:%S")
+
+
+# ───────────────────────────── config ─────────────────────────────
+
+def load_cfg():
+    try:
+        return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_cfg(cfg):
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(
+        json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def api_creds(cfg):
+    api_id = cfg.get("api_id") or os.environ.get("TG_API_ID")
+    api_hash = cfg.get("api_hash") or os.environ.get("TG_API_HASH")
+    if not api_id or not api_hash:
+        die("нет API-ключей.\n"
+            "  Получи api_id/api_hash на https://my.telegram.org → 'API development tools',\n"
+            "  затем запусти:  tgu login  (или задай TG_API_ID / TG_API_HASH).")
+    return int(api_id), str(api_hash)
+
+
+def build_client():
+    api_id, api_hash = api_creds(load_cfg())
+    if not SESSION_DB.exists():
+        die("нет сессии. Сначала войди:  tgu login")
+    return TelegramClient(str(SESSION_FILE), api_id, api_hash)
+
+
+# ───────────────────────────── common helpers ─────────────────────────────
+
+def entity_name(e):
+    if e is None:
+        return "?"
+    if getattr(e, "title", None):
+        return e.title
+    n = " ".join(x for x in (getattr(e, "first_name", None),
+                             getattr(e, "last_name", None)) if x)
+    return n or (e.username and "@" + e.username) or str(e.id)
+
+
+def shutdown(client):
+    """Корректно отключиться (sync-контекст): disconnect() сам завершает соединение."""
+    try:
+        client.disconnect()
+    except Exception:
+        pass
+
+
+async def get_dialogs(client, limit=None):
+    return [d async for d in client.iter_dialogs(limit=limit)]
+
+
+def dialog_uname(d):
+    u = getattr(d.entity, "username", None)
+    return u.lower() if u else None
+
+
+def fuzzy_find(dialogs, q):
+    """Лучший диалог по подстроке в названии/@username/id."""
+    q = q.lower().lstrip("#")
+    cands = []
+    for d in dialogs:
+        name = (d.name or "").lower()
+        un = dialog_uname(d)
+        sid = str(d.id)
+        score = 0
+        if name == q:
+            score = 6
+        elif un == q or un == q.lstrip("@"):
+            score = 5
+        elif sid == q:
+            score = 5
+        elif name.startswith(q):
+            score = 4
+        elif q in name:
+            score = 3
+        elif un and (un.startswith(q.lstrip("@")) or q.lstrip("@") in un):
+            score = 2
+        if score:
+            cands.append((score, d))
+    cands.sort(key=lambda x: -x[0])
+    return cands
+
+
+async def resolve(client, ref):
+    """Разрешить: 'me', число-ид, @username, t.me-ссылку, или подстроку имени."""
+    if not ref or not ref.strip():
+        die("нужно указать имя/юзернейм/ид чата (например: tgu read \"Друзья\" --last 10)")
+    ref = ref.strip()
+    low = ref.lower().lstrip("#")
+    ds = None
+
+    if low in ("me", "saved", "избранное", "saved messages"):
+        return await client.get_entity("me")
+
+    if "t.me" in ref:
+        if "joinchat/" in ref or re.search(r"t\.me/\+", ref):
+            try:
+                return await client.get_entity(ref)
+            except Exception:
+                die("не удалось найти сущность по ссылке %s" % ref)
+        m = T_LINK.search(ref)
+        try:
+            return await client.get_entity(m.group(1))
+        except Exception:
+            die("не удалось найти сущность по ссылке %s" % ref)
+
+    if T_INT.fullmatch(ref):
+        try:
+            return await client.get_entity(int(ref))
+        except Exception:
+            die("нет сущности с id=%s (если это приватный чат — возьми id из `tgu chats`)" % ref)
+
+    if ref.startswith("@"):
+        ds = ds or await get_dialogs(client)
+        for d in ds:
+            un = dialog_uname(d)
+            if un and un == ref[1:].lower():
+                return d.entity
+        try:
+            return await client.get_entity(ref)
+        except Exception:
+            die("нет @-юзернейма %s" % ref)
+
+    ds = ds or await get_dialogs(client)
+    cands = fuzzy_find(ds, ref)
+    best = [d for s, d in cands if s == cands[0][0]] if cands else []
+    if not best:
+        names = ", ".join(d.name or str(d.id) for d in ds[:10])
+        die("чат по строке %r не найден. Примеры твоих чатов: %s" % (ref, names))
+    if len(best) > 1:
+        opts = "\n".join("  • %s (@%s, id %s)" % (d.name, dialog_uname(d) or "-", d.id)
+                         for d in best[:8])
+        die("под %r подходят несколько чатов, уточни:\n%s" % (ref, opts))
+    return best[0].entity
+
+
+def describe_media(msg):
+    """(тег, имя_файла) для сообщения с медиа."""
+    md = msg.media
+    if not md:
+        return "", None
+    ts = tl
+    if isinstance(md, ts.MessageMediaPhoto):
+        return "фото", None
+    if isinstance(md, ts.MessageMediaDocument):
+        doc = md.document
+        attrs = getattr(doc, "attributes", []) or []
+        name = None
+        for a in attrs:
+            if getattr(a, "file_name", None):
+                name = a.file_name
+        for a in attrs:
+            if isinstance(a, ts.DocumentAttributeAnimated):
+                return "gif", name
+            if isinstance(a, ts.DocumentAttributeSticker):
+                return "стикер", name
+            if isinstance(a, ts.DocumentAttributeVideo):
+                return ("видеокружение" if a.round_message else "видео"), name
+            if isinstance(a, ts.DocumentAttributeAudio):
+                return ("голосовое" if a.voice else "аудио"), name
+            if isinstance(a, ts.DocumentAttributeFilename) and not name:
+                name = getattr(a, "file_name", None)
+        return "документ", name
+    if isinstance(md, ts.MessageMediaPoll):
+        return "опрос", None
+    if isinstance(md, ts.MessageMediaContact):
+        return "контакт", None
+    if isinstance(md, (ts.MessageMediaGeo, getattr(ts, "MessageMediaGeoLive", object))):
+        return "геолокация", None
+    if isinstance(md, ts.MessageMediaWebPage):
+        return "ссылка", None
+    if isinstance(md, getattr(ts, "MessageMediaDice", object)):
+        return "кубик", None
+    return "медиа", None
+
+
+def _u16_to_py(text, u):
+    """Индекс в python-строке по UTF-16-смещению Telegram."""
+    if u <= 0:
+        return 0
+    c = 0
+    for i, ch in enumerate(text):
+        if c >= u:
+            return i
+        c += 2 if ord(ch) > 0xFFFF else 1
+    return len(text)
+
+
+def _ent_code(e):
+    t = tl
+    if isinstance(e, t.MessageEntityBold):
+        return "1"
+    if isinstance(e, t.MessageEntityItalic):
+        return "3"
+    if isinstance(e, t.MessageEntityUnderline):
+        return "4"
+    if isinstance(e, t.MessageEntityStrike):
+        return "9"
+    if isinstance(e, (t.MessageEntityCode, getattr(t, "MessageEntityInlineCode", object))):
+        return "36"
+    if isinstance(e, t.MessageEntityPre):
+        return "32"
+    if isinstance(e, t.MessageEntitySpoiler):
+        return "2"
+    if isinstance(e, (t.MessageEntityUrl, t.MessageEntityTextUrl)):
+        return "34;4"
+    if isinstance(e, (t.MessageEntityMention, t.MessageEntityMentionName)):
+        return "34"
+    if isinstance(e, (t.MessageEntityEmail, t.MessageEntityPhone)):
+        return "4"
+    if isinstance(e, (t.MessageEntityHashtag, t.MessageEntityCashtag,
+                      getattr(t, "MessageEntityBotCommand", object))):
+        return "1"
+    return None
+
+
+def ansi_render(text, entities):
+    if not text:
+        return text
+    n = len(text)
+    styles = [set() for _ in range(n)]
+    for e in entities or []:
+        code = _ent_code(e)
+        if not code:
+            continue
+        s = _u16_to_py(text, e.offset)
+        en = _u16_to_py(text, e.offset + e.length)
+        for i in range(min(s, n), min(en, n)):
+            styles[i].add(code)
+    out = []
+    cur = None
+    buf = ""
+    flush_sentinel = object()
+
+    def flush(new):
+        nonlocal cur, buf
+        if buf:
+            if cur:
+                out.append("\033[" + ";".join(sorted(cur)) + "m" + buf + "\033[0m")
+            else:
+                out.append(buf)
+        buf = ""
+        cur = new
+
+    cur = frozenset()
+    for ch, st in zip(text, styles):
+        fs = frozenset(st)
+        if fs != cur:
+            flush(fs)
+        buf += ch
+    flush(frozenset())
+    return "".join(out)
+
+
+def render_text(m, raw=False):
+    """Текст сообщения: ANSI-стили из сущностей, сырой markdown или plain."""
+    text = msg_text(m)
+    if not text:
+        return ""
+    if raw:
+        from telethon.extensions import markdown as _md
+        return _md.unparse(text, m.entities)
+    if _on():
+        return ansi_render(text, m.entities)
+    return text
+
+
+def _rich_block_text(t):
+    """Текст из Text* элемента rich_message (TextPlain/TextConcat/TextCustomEmoji/...)."""
+    if t is None:
+        return ""
+    if hasattr(t, "texts"):          # TextConcat
+        return "".join(_rich_block_text(x) for x in (t.texts or []))
+    alt = getattr(t, "alt", None)    # TextCustomEmoji
+    if alt is not None:
+        return alt
+    if hasattr(t, "text"):           # TextPlain, TextUrl, TextEmail, ...
+        return t.text or ""
+    return ""
+
+
+def rich_message_text(m):
+    """Текст «богатого» сообщения (rich_message) — новые посты, где message=''. """
+    rm = getattr(m, "rich_message", None)
+    if not rm:
+        return ""
+    lines = []
+    for b in (rm.blocks or []):
+        name = type(b).__name__
+        if name == "PageBlockButtonRow":
+            for btn in (getattr(b, "buttons", None) or []):
+                bt = _rich_block_text(getattr(btn, "text", None)).strip()
+                if not bt:
+                    continue
+                url = getattr(getattr(btn, "type", None), "url", None)
+                lines.append("[кнопка] %s%s" % (bt, " (🔗 %s)" % url if url else ""))
+        elif hasattr(b, "text"):
+            s = _rich_block_text(getattr(b, "text", None)).strip()
+            if s:
+                lines.append(bold(s) if name.startswith("PageBlockHeading") else s)
+    return "\n".join(lines)
+
+
+def msg_text(m):
+    """Весь читаемый текст сообщения: обычный или из rich_message."""
+    return m.message or rich_message_text(m)
+
+
+def btn_rows(msg):
+    """Строки кнопок сообщения (для вывода) или None."""
+    rm = getattr(msg, "reply_markup", None)
+    rows = getattr(rm, "rows", None)
+    if not rows:
+        return None
+    out = []
+    for row in rows:
+        cells = []
+        for b in row.buttons:
+            if isinstance(b, tl.KeyboardButtonUrl):
+                cells.append(cyan(b.text) + dim("(🔗 %s)" % (b.url[:40])))
+            elif isinstance(b, tl.KeyboardButtonCallback) or \
+                    type(b).__name__ == "KeyboardButtonCallback":
+                cells.append(bold(b.text) + dim("(кнопка)"))
+            elif hasattr(b, "text"):
+                cells.append(str(b.text))
+            else:
+                cells.append(dim(type(b).__name__))
+        if cells:
+            out.append("  ⌨ " + " │ ".join(cells))
+    return "\n".join(out) if out else None
+
+
+def _btn_kind(b):
+    if isinstance(b, tl.KeyboardButtonUrl):
+        return {"text": b.text, "kind": "url", "url": b.url}
+    if type(b).__name__ == "KeyboardButtonCallback":
+        data = getattr(b, "data", b"")
+        try:
+            data = data.decode("utf-8", "replace")
+        except Exception:
+            pass
+        return {"text": b.text, "kind": "callback", "data": data}
+    return {"text": getattr(b, "text", None), "kind": type(b).__name__}
+
+
+def fmt_msg(msg, sender_name, raw=False):
+    if isinstance(msg, tl.MessageService):
+        act = type(getattr(msg, "action", None)).__name__
+        return "%s %s" % (dim("[%s]" % msg.id), dim("* " + act))
+    who = "Ты →" if msg.out else (sender_name or "id%s" % msg.sender_id)
+    tag, fname = describe_media(msg)
+    parts = [
+        dim("[%d]" % msg.id),
+        dim(fdate(msg.date)),
+        bold(who),
+    ]
+    if msg.reply_to:
+        parts.append(dim("⤶%s" % msg.reply_to.reply_to_msg_id))
+    if tag:
+        parts.append(cyan("[%s]" % tag))
+    txt = render_text(msg, raw=raw)
+    if txt:
+        parts.append(txt)
+    line = " ".join(parts)
+    btns = btn_rows(msg)
+    if btns:
+        line += "\n" + btns
+    return line
+
+
+def msg_json(msg, sender_name):
+    tag, fname = describe_media(msg)
+    d = {
+        "id": msg.id,
+        "chat_id": msg.chat_id,
+        "date": local(msg.date).isoformat() if msg.date else None,
+        "out": bool(msg.out),
+        "sender_id": msg.sender_id,
+        "sender": sender_name,
+        "text": msg_text(msg),
+        "reply_to": getattr(getattr(msg, "reply_to", None), "reply_to_msg_id", None),
+        "media": tag or None,
+        "file": fname,
+        "size": getattr(getattr(getattr(msg, "document", None) or getattr(msg, "photo", None), "size", {}), "size", None)
+                if (tag in ("фото", "видео", "документ", "аудио", "голосовое", "gif")) else None,
+        "edit_date": local(msg.edit_date).isoformat() if msg.edit_date else None,
+        "buttons": [
+            [_btn_kind(b) for b in row.buttons]
+            for row in (getattr(getattr(msg, "reply_markup", None), "rows", None) or [])
+        ] or None,
+    }
+    return d
+
+
+def status_text(s):
+    if s is None:
+        return "-"
+    t = tl
+    if isinstance(s, t.UserStatusOnline):
+        return "в сети"
+    if isinstance(s, t.UserStatusOffline):
+        return "был(а) " + fdate(s.was_online)
+    if isinstance(s, t.UserStatusRecently):
+        return "недавно"
+    if isinstance(s, t.UserStatusLastWeek):
+        return "на прошлой неделе"
+    if isinstance(s, t.UserStatusLastMonth):
+        return "в прошлом месяце"
+    return "-"
+
+
+MEDIA_FILTERS = {
+    "photo": InputMessagesFilterPhotos,
+    "video": InputMessagesFilterVideo,
+    "doc": InputMessagesFilterDocument,
+    "document": InputMessagesFilterDocument,
+    "voice": InputMessagesFilterVoice,
+    "audio": InputMessagesFilterMusic,
+    "music": InputMessagesFilterMusic,
+    "gif": InputMessagesFilterGif,
+    "round": InputMessagesFilterRoundVideo,
+    "url": InputMessagesFilterUrl,
+}
+
+
+def parse_when(s):
+    if not s:
+        return None
+    t = s.strip().lower()
+    now = dt.datetime.now()
+    m = re.fullmatch(r"(\d+)\s*([dhwmчдн])", t)
+    if m:
+        n, u = int(m[1]), m[2]
+        sec = {"h": 3600, "ч": 3600, "d": 86400, "д": 86400,
+               "w": 604800, "н": 604800, "m": 60, "м": 60}[u]
+        return (now - dt.timedelta(seconds=n * sec)).astimezone()
+    if t in ("today", "сегодня"):
+        return now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone()
+    if t in ("yesterday", "вчера"):
+        return (now - dt.timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0).astimezone()
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", t):
+            d = dt.datetime.fromisoformat(t + "T00:00")
+        else:
+            d = dt.datetime.fromisoformat(s)
+        return d.astimezone()
+    except ValueError:
+        die("не понял дату %r (форматы: 2026-10-22, '2026-10-22 10:00', 3d/2w/5ч, yesterday)" % s)
+
+
+def build_fetch(args):
+    """Аргументы для iter_messages + пост-фильтры из общих опций read/pull."""
+    kw = {}
+    post = {}
+    if getattr(args, "ids", None):
+        kw["ids"] = args.ids
+    else:
+        kw["limit"] = None if args.all else (args.last or 20)
+        frm = getattr(args, "from_", None)
+        if args.mine:
+            kw["from_user"] = "me"
+        elif frm and (frm.startswith("@") or T_INT.fullmatch(frm) or frm.lower() == "me"):
+            kw["from_user"] = frm
+        elif frm:
+            post["name"] = frm.lower()
+        if getattr(args, "search", None):
+            kw["search"] = args.search
+        mt = getattr(args, "type", None)
+        if mt:
+            if mt in MEDIA_FILTERS:
+                kw["filter"] = MEDIA_FILTERS[mt]()
+            else:
+                post["media_type"] = mt
+    # пост-фильтры режут выборку сервера — расширяем окно, чтобы не потерять всё
+    if (post.get("name") or post.get("media_type")) and kw.get("limit"):
+        kw["limit"] = min(kw["limit"] * 10, 1000)
+    if getattr(args, "since", None):
+        post["since"] = parse_when(args.since)
+    if getattr(args, "until", None):
+        post["until"] = parse_when(args.until)
+    if getattr(args, "incoming", False):
+        post["incoming"] = True
+    return kw, post
+
+
+def keep_msg(msg, post):
+    if isinstance(msg, tl.MessageService):
+        return not post
+    if post.get("incoming") and msg.out:
+        return False
+    if post.get("name"):
+        sname = ""
+        s = msg.sender
+        if s:
+            sname = (entity_name(s) or "").lower()
+            #sender username check
+            un = getattr(s, "username", None)
+            if un:
+                sname += " @" + un.lower()
+        if post["name"] not in sname:
+            return False
+    d = msg.date
+    if d:
+        d = d.astimezone()
+    if post.get("since") and (not d or d < post["since"]):
+        return False
+    if post.get("until") and (not d or d > post["until"]):
+        return False
+    if post.get("media_type"):
+        tag, _ = describe_media(msg)
+        if tag != post["media_type"]:
+            return False
+    return True
+
+
+async def fetch_msgs(client, ent, args):
+    kw, post = build_fetch(args)
+    out = []
+    async for m in client.iter_messages(ent, **kw):
+        if m is None:
+            continue
+        if not keep_msg(m, post):
+            continue
+        out.append(m)
+    out.reverse()  # старые сверху
+    return out
+
+
+# ───────────────────────────── commands ─────────────────────────────
+
+def cmd_login(args):
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+    cfg = load_cfg()
+    api_id = args.api_id or cfg.get("api_id") or os.environ.get("TG_API_ID")
+    api_hash = args.api_hash or cfg.get("api_hash") or os.environ.get("TG_API_HASH")
+
+    if not api_id or not api_hash:
+        print("Нет API-ключей. Получи их на https://my.telegram.org → 'API development tools'\n")
+        try:
+            api_id = input(bold("api_id: ")).strip()
+            api_hash = input(bold("api_hash: ")).strip()
+        except (EOFError, KeyboardInterrupt):
+            print(); sys.exit(1)
+        if not (api_id.isdigit() and api_hash):
+            die("api_id должен быть числом, api_hash — строкой")
+
+    cfg["api_id"], cfg["api_hash"] = int(api_id), str(api_hash)
+    save_cfg(cfg)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    client = TelegramClient(str(SESSION_FILE), int(api_id), str(api_hash))
+    try:
+        print(dim("— входим, следуй подсказкам (телефон → код из Telegram → 2FA, если есть)"))
+        client.start()
+        me = loop.run_until_complete(client.get_me())
+        cfg["download_dir"] = cfg.get("download_dir", str(DEFAULT_DL_DIR))
+        save_cfg(cfg)
+        print(green("\n✓ Готово! Вошёл как: ") +
+              bold(entity_name(me)) + dim(" (@%s, id %s)" %
+                                          (me.username or "-", me.id)))
+        print(dim("Дальше пробуй:\n  tgu chats\n  tgu read \"чат\" --last 10\n  tgu send chat Привет!"))
+    finally:
+        shutdown(client)
+        loop.close()
+
+
+def cmd_logout(args):
+    client = build_client()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(client.connect())
+        if loop.run_until_complete(client.log_out()):
+            print(green("✓ Вышел, локальная сессия удалена."))
+        else:
+            print("сессия удалена локально (сервер не подтвердил).")
+    finally:
+        shutdown(client)
+        loop.close()
+
+
+def cmd_status(args):
+    if not SESSION_DB.exists():
+        print(yellow("нет сессии") + " — запусти: tgu login")
+        sys.exit(1)
+    if not (load_cfg().get("api_id") or os.environ.get("TG_API_ID")):
+        print(yellow("нет api_id/api_hash в конфиге") + " — запусти: tgu login")
+        sys.exit(1)
+    client = build_client()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(client.connect())
+        ok = loop.run_until_complete(client.is_user_authorized())
+        if ok:
+            me = loop.run_until_complete(client.get_me())
+            print(green("✓ авторизован: ") + bold(entity_name(me)) +
+                  dim(" (@%s, id %s, телефон %s)" %
+                      (me.username or "-", me.id, me.phone or "-")))
+        else:
+            print(yellow("сессия есть, но не авторизована") + " — запусти: tgu login заново")
+            sys.exit(1)
+        print(dim("session: %s | telethon %s" % (SESSION_FILE, telethon_version)))
+    finally:
+        shutdown(client)
+        loop.close()
+
+
+async def cmd_me(client, args):
+    me = await client.get_me()
+    full = None
+    try:
+        full = await client(GetFullUserRequest(me))
+    except Exception:
+        pass
+    p("Имя:        " + bold(entity_name(me)))
+    p("id:         %s" % me.id)
+    if me.username:
+        p("username:   @" + me.username)
+    unames = getattr(me, "usernames", None)
+    if unames:
+        extra = " ".join("@" + u.username for u in unames)
+        if extra.strip():
+            p("usernames:  %s" % extra.strip())
+    if me.phone:
+        p("телефон:    " + me.phone)
+    if me.bot:
+        p("тип:        бот")
+    if getattr(me, "premium", False):
+        p("premium:    да")
+    about = getattr(full.full_user, "about", None) if full else None
+    if about:
+        p("о себе:     " + about)
+    p(dim("папка загрузок: %s (поменять: tgu config download_dir <путь>)" %
+          load_cfg().get("download_dir", DEFAULT_DL_DIR)))
+
+
+def p(line=""):
+    print(line)
+
+
+async def cmd_user(client, args):
+    ent = await resolve(client, args.who)
+    name = entity_name(ent)
+    p(bold(name) + dim("  [%s]" % type(ent).__name__))
+    p("id:         %s" % ent.id)
+    if getattr(ent, "username", None):
+        p("username:   @" + ent.username)
+    if getattr(ent, "phone", None):
+        p("телефон:    " + ent.phone)
+    if getattr(ent, "bot", False):
+        p("тип:        бот")
+    else:
+        p("статус:     " + status_text(getattr(ent, "status", None)))
+    for flag, label in (("verified", "verified"), ("premium", "premium"),
+                        ("fake", "fake"), ("scam", "scam"),
+                        ("restricted", "ограничен")):
+        if getattr(ent, flag, False):
+            p("%s:  %s" % (label, "да"))
+    # доп. инфа
+    try:
+        if isinstance(ent, tl.User):
+            full = await client(GetFullUserRequest(ent))
+            if full.full_user.about:
+                p("о себе:     " + full.full_user.about)
+            if full.users and full.full_user.common_chats_count:
+                p("общих чатов: %s" % full.full_user.common_chats_count)
+        elif isinstance(ent, tl.Channel):
+            full = await client(GetFullChannelRequest(ent))
+            if full.full_chat.participants_count:
+                p("участников: %s" % full.full_chat.participants_count)
+            if full.full_chat.about:
+                p("о канале:   " + full.full_chat.about)
+    except Exception as e:
+        warn("детали не получены: %s" % e)
+
+
+async def cmd_contacts(client, args):
+    try:
+        users = await client.get_contacts()
+    except Exception:
+        from telethon.tl.functions.contacts import GetContactsRequest
+        res = await client(GetContactsRequest(hash=0))
+        users = res.users or []
+    if not users:
+        p("нет контактов")
+        return
+    for u in sorted(users, key=entity_name):
+        marks = []
+        if u.bot: marks.append("бот")
+        if u.id not in [0] and not u.username:
+            marks.append("без @")
+        p("%s  %s" % (bold(entity_name(u)), dim("id %s %s" % (
+            u.id, ("(" + ", ".join(marks) + ")") if marks else ""))))
+
+
+async def cmd_chats(client, args):
+    limit = None if args.all else (args.limit or 50)
+    ds = await get_dialogs(client, limit=limit)
+    rows = []
+    for d in ds:
+        e = d.entity
+        typ = "u"
+        if getattr(e, "bot", False):
+            typ = "b"
+        elif isinstance(e, tl.Channel) and getattr(e, "megagroup", False):
+            typ = "g"
+        elif isinstance(e, tl.Channel):
+            typ = "c"
+        elif isinstance(e, tl.Chat):
+            typ = "g"
+        if args.type and args.type != typ:
+            continue
+        if args.unread and not d.unread_count:
+            continue
+        uname = "@" + e.username if getattr(e, "username", None) else "-"
+        last = ""
+        m = d.message
+        if m:
+            if isinstance(m, tl.MessageService):
+                last = "* сервисное сообщение"
+            else:
+                tag, _ = describe_media(m)
+                last = (("[%s] " % tag) if tag else "") + \
+                    ((m.message or rich_message_text(m)) or "")
+                last = " ".join(last.split())[:60]
+                if m.out:
+                    last = "Ты: " + last
+        rows.append({
+            "id": d.id, "type": typ, "name": d.name or (e.username or str(d.id)),
+            "username": uname, "unread": d.unread_count, "last": last,
+            "date": d.date.timestamp() if d.date else 0,
+        })
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return
+    for r in rows:
+        line = "%s %-1s %-14s %s%s  %s" % (
+            green("%3d" % (r["unread"] or 0)) if r["unread"] else dim("  0"),
+            dim(r["type"]), dim(str(r["id"])), bold(r["name"]),
+            dim(" " + r["username"]) if r["username"] != "-" else "",
+            dim("· " + r["last"]) if r["last"] else "")
+        p(line)
+
+
+async def _print_msgs(client, msgs, args, title=None):
+    if args.json:
+        arr = []
+        for m in msgs:
+            s = m.sender
+            name = await _sender_name(client, m)
+            arr.append(msg_json(m, name))
+        print(json.dumps(arr, ensure_ascii=False, indent=2))
+        return
+    if title:
+        p(dim("── %s ──" % title))
+    raw = getattr(args, "raw", False)
+    for m in msgs:
+        name = await _sender_name(client, m)
+        p(fmt_msg(m, name, raw=raw))
+
+
+async def _sender_name(client, m):
+    try:
+        s = await m.get_sender()
+        return entity_name(s) if s else None
+    except Exception:
+        return None
+
+
+async def cmd_read(client, args):
+    ent = await resolve(client, args.chat)
+    msgs = await fetch_msgs(client, ent, args)
+    if args.ids_only:
+        print(" ".join(str(m.id) for m in msgs if not isinstance(m, tl.MessageService)))
+        return
+    await _print_msgs(client, msgs, args, title="%s (%d сообщ.)" %
+                      (entity_name(ent), len(msgs)))
+
+
+async def cmd_search(client, args):
+    q = " ".join(args.query).strip()
+    if not q:
+        die("пустой запрос")
+    if args.chat:
+        ent = await resolve(client, args.chat)
+        it = await client.get_messages(ent, search=q, limit=args.limit)
+        await _print_msgs(client, [m for m in it if m], args,
+                          title="поиск %r в %r" % (q, entity_name(ent)))
+        return
+    # глобальный поиск по последним диалогам
+    nd = 30 if not args.deep else (args.limit or 100)
+    ds = await get_dialogs(client, limit=nd)
+    found = []
+    for d in ds:
+        try:
+            res = await client.get_messages(d.entity, search=q, limit=20)
+            hits = [m for m in res if m]
+            if hits:
+                found.append((d, hits))
+        except FloodError:
+            warn("флуд-лимит при поиске в %r, останавливаюсь" % (d.name,))
+            break
+    if not found:
+        p("ничего не нашлось по %r" % q)
+        return
+    for d, hits in found:
+        await _print_msgs(client, hits, args, title=d.name)
+
+
+def build_markup(args):
+    """--button 'ТЕКСТ|URL' / --button 'ТЕКСТ' → ReplyMarkup или None."""
+    specs = getattr(args, "button", None)
+    if not specs:
+        return None
+    kb = []
+    for spec in specs:
+        if "|" in spec:
+            text, url = spec.split("|", 1)
+            if not url:
+                die("кнопка %r: пустой url (формат 'ТЕКСТ|URL')" % spec)
+            kb.append(tl.KeyboardButtonUrl(text=text.strip() or url, url=url))
+        else:
+            text = spec.strip()
+            if not text:
+                die("пустая кнопка")
+            kb.append(tl.KeyboardButton(text=text))
+    if any(isinstance(b, tl.KeyboardButtonUrl) for b in kb) and \
+            any(isinstance(b, tl.KeyboardButton) for b in kb):
+        die("смешивать url-кнопки и текстовые в одном сообщении нельзя — "
+            "используй два сообщения")
+    if kb and isinstance(kb[0], tl.KeyboardButton):
+        return tl.ReplyKeyboardMarkup(rows=[tl.KeyboardButtonRow(buttons=kb)],
+                                      resize=True)
+    rows = []
+    for i in range(0, len(kb), 4):
+        rows.append(tl.KeyboardButtonRow(buttons=kb[i:i + 4]))
+    return tl.ReplyInlineMarkup(rows=rows)
+
+
+async def cmd_send(client, args):
+    ent = await resolve(client, args.chat)
+    text = " ".join(args.text).strip()
+    if not text and not args.file:
+        print(dim("введи сообщение (Ctrl+D — отправить):"))
+        text = sys.stdin.read().strip()
+        if not text:
+            die("пусто — нечего отправлять")
+    if args.file:
+        path = Path(os.path.expanduser(args.file))
+        if not path.exists():
+            die("файл не найден: %s" % path)
+        msg = await client.send_file(ent, str(path), caption=text or None,
+                                     force_document=not args.photo,
+                                     reply_to=args.reply, silent=args.silent,
+                                     buttons=build_markup(args))
+    else:
+        parse = "md" if not args.plain else None
+        if args.html:
+            parse = "html"
+        msg = await client.send_message(ent, text, reply_to=args.reply,
+                                        silent=args.silent, parse_mode=parse,
+                                        buttons=build_markup(args))
+    p(green("✓ отправлено ") + dim("[%d] в %s" % (msg.id, entity_name(ent))))
+
+
+async def cmd_click(client, args):
+    ent = await resolve(client, args.chat)
+    msgs = await client.get_messages(ent, ids=args.id)
+    msg = msgs[0] if isinstance(msgs, list) else msgs
+    if not msg:
+        die("сообщение [%d] не найдено в %r" % (args.id, entity_name(ent)))
+    rm = getattr(msg, "reply_markup", None)
+    rows = getattr(rm, "rows", None)
+    if not rows:
+        die("у сообщения [%d] нет кнопок" % args.id)
+
+    def flat_list():
+        flat = [b for row in rows for b in row.buttons]
+        return flat
+
+    if isinstance(rm, tl.ReplyKeyboardMarkup):
+        # reply-клавиатура: «нажать» = отправить текст кнопки
+        for row in rows:
+            for b in row.buttons:
+                if args.button.lower() in getattr(b, "text", "").lower():
+                    await client.send_message(ent, b.text)
+                    p(green("✓ нажата reply-кнопка") +
+                      dim(" %r → отправлен текст" % b.text))
+                    return
+        die("reply-кнопка %r не найдена; варианты: %s" %
+            (args.button, " / ".join(getattr(b, "text", "?")
+                                     for r in rows for b in r.buttons)))
+
+    flat = flat_list()
+    sel = args.button
+    if T_INT.fullmatch(sel.strip()):
+        i = int(sel)
+        if not (0 <= i < len(flat)):
+            die("нет кнопки №%d (всего %d). Варианты:\n  %s" %
+                (i, len(flat), "\n  ".join(
+                    "%d. %s" % (j, getattr(b, "text", "?"))
+                    for j, b in enumerate(flat))))
+        btn = flat[i]
+    else:
+        hits = [b for b in flat if sel.lower() in getattr(b, "text", "").lower()]
+        if not hits:
+            die("кнопка по тексту %r не найдена. Варианты:\n  %s" %
+                (sel, "\n  ".join("%d. %s" % (j, getattr(b, "text", "?"))
+                                  for j, b in enumerate(flat))))
+        if len(hits) > 1:
+            die("под %r несколько кнопок: %s — укажи номер" %
+                (sel, " / ".join(getattr(b, "text", "?") for b in hits)))
+        btn = hits[0]
+    if isinstance(btn, tl.KeyboardButtonUrl):
+        warn("это url-кнопка, у неё нечего «нажимать»: %s" % btn.url)
+        return
+    res = await msg.click(btn)
+    p(green("✓ нажата кнопка %r" % getattr(btn, "text", "?")))
+    if isinstance(res, tl.Message):
+        p(dim("текст после нажатия: " + (res.message or "(пусто)")))
+    p(green("✓ отправлено ") + dim("[%d] в %s" % (msg.id, entity_name(ent))))
+
+
+async def cmd_push(client, args):
+    ent = await resolve(client, args.chat)
+    files = []
+    for f in args.files:
+        p_ = Path(os.path.expanduser(f))
+        if not p_.exists():
+            die("файл не найден: %s" % p_)
+        files.append(str(p_))
+    caption = " ".join(args.caption).strip() or None
+    if not args.yes and len(files) > 20:
+        ans = input("отправить %d файлов? [y/N] " % len(files)).lower()
+        if ans not in ("y", "yes", "д", "да"):
+            die("отменено", 0)
+    msg = await client.send_file(ent, files, caption=caption,
+                                 force_document=not args.as_photo,
+                                 reply_to=args.reply, silent=args.silent)
+    sent = msg if isinstance(msg, list) else [msg]
+    p(green("✓ отправлено %d файл(ов)" % len(sent)) +
+      dim(" (id %s)" % ", ".join(str(m.id) for m in sent)))
+
+
+async def cmd_pull(client, args):
+    ent = await resolve(client, args.chat)
+    cfg = load_cfg()
+    dest = Path(os.path.expanduser(args.dest or cfg.get("download_dir",
+                                                        str(DEFAULT_DL_DIR))))
+    dest.mkdir(parents=True, exist_ok=True)
+    msgs = await fetch_msgs(client, ent, args)
+    have = [m for m in msgs if m.media and not isinstance(m, tl.MessageService)]
+    if not have:
+        p("нет медиа по заданным фильтрам")
+        return
+    total = 0
+    paths = []
+    for m in have:
+        tag, fname = describe_media(m)
+        if args.dry_run:
+            p(dim("[%d] " % m.id) + cyan("[%s]" % tag) + " " + (fname or "<без имени>"))
+            continue
+        def _prog(cur, tot, _m=m):
+            if tot:
+                sys.stdout.write("\r%s %s %3d%%" %
+                                 (dim("[%d]" % _m.id), cyan("[%s]" % tag),
+                                  cur * 100 // tot))
+                sys.stdout.flush()
+        try:
+            path = await m.download_media(file=str(dest), progress_callback=_prog)
+            if path:
+                if sys.stdout.isatty():
+                    sys.stdout.write("\033[K\r")
+                size = None
+                try:
+                    size = Path(path).stat().st_size
+                except Exception:
+                    pass
+                total += size or 0
+                paths.append(path)
+                p(dim("[%d] " % m.id) + cyan("[%s]" % tag) + green(" → ") + path +
+                  (" " + dim("(%s)" % human(size)) if size else ""))
+        except FloodError:
+            warn("флуд-лимит, остановка"); break
+        except Exception as e:
+            warn("не скачалось [%d]: %s" % (m.id, e))
+    if not args.dry_run:
+        p(green("✓ скачано %d файл(ов), %s → %s" % (len(paths), human(total), dest)))
+
+
+async def cmd_edit(client, args):
+    ent = await resolve(client, args.chat)
+    text = " ".join(args.text)
+    msg = await client.edit_message(ent, args.id, text)
+    p(green("✓ редактировано [%d]" % msg.id))
+
+
+async def cmd_delete(client, args):
+    ent = await resolve(client, args.chat)
+    ids = args.ids
+    mine_last = None
+    if args.last and not ids:
+        it = await client.get_messages(ent, from_user="me" if args.mine else None,
+                                       limit=args.last)
+        ids = [m.id for m in it if m]
+        if ids and not args.mine and not args.yes:
+            ans = input("удалить последние %d сообщ.? [y/N] " % len(ids)).lower()
+            if ans not in ("y", "yes", "д", "да"):
+                die("отменено", 0)
+    if not ids:
+        die("нужны id сообщений (посмотри в `tgu read`) или --last N")
+    ok = await client.delete_messages(ent, ids, revoke=not args.recover)
+    p(green("✓ удалено %d сообщ. %s" % (len(ids) if ok is None else len(ids),
+                                        dim("(только у себя)" if args.recover else
+                                             "(у всех)"))))
+
+
+async def cmd_forward(client, args):
+    ent = await resolve(client, args.chat)
+    dst = await resolve(client, args.to)
+    msgs = await client.forward_messages(dst, args.ids, ent)
+    lst = msgs if isinstance(msgs, list) else [msgs]
+    p(green("✓ переслано %d сообщ." % len(lst)) + dim(" в %s" % entity_name(dst)))
+
+
+async def cmd_mark(client, args):
+    ent = await resolve(client, args.chat)
+    await client.send_read_acknowledge(ent, max_id=args.up_to)
+    p(green("✓ отмечено прочитанным") + dim(" %s" % entity_name(ent)))
+
+
+async def cmd_pin(client, args):
+    ent = await resolve(client, args.chat)
+    msg = await client.pin_message(ent, args.id, notify=args.notify)
+    p(green("✓ закреплено" + (" [%d]" % msg.id if msg else "")))
+
+
+async def cmd_unpin(client, args):
+    ent = await resolve(client, args.chat)
+    msg = await client.pin_message(ent, args.id) if args.id \
+        else await client.pin_message(ent, None)
+    p(green("✓ откреплено %s" % (("[%d]" % msg.id) if msg else "")))
+
+
+async def cmd_reply(client, args):
+    ent = await resolve(client, args.chat)
+    text = " ".join(args.text).strip()
+    if not text:
+        print(dim("введи ответ (Ctrl+D):"))
+        text = sys.stdin.read().strip()
+    msg = await client.send_message(ent, text, reply_to=args.id, silent=args.silent)
+    p(green("✓ отправлено ") + dim("[%d] как ответ на %d" % (msg.id, args.id)))
+
+
+# ───────────────────────────── argparse ─────────────────────────────
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog=PROG, description="Удобный CLI-клиент Telegram (Telethon)",
+        epilog=EXAMPLES, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version", version="%s %s (telethon %s)"
+                    % (PROG, VERSION, telethon_version))
+    ap.add_argument("--no-color", action="store_true", help="без ANSI-цветов")
+    sub = ap.add_subparsers(dest="cmd")
+
+    # ---- служебные
+    q = sub.add_parser("login", help="вход в аккаунт (первый запуск)")
+    q.add_argument("--api-id", help="api_id с my.telegram.org")
+    q.add_argument("--api-hash", help="api_hash с my.telegram.org")
+    q.set_defaults(fn=cmd_login, sync=True)
+
+    q = sub.add_parser("logout", help="выйти и удалить сессию")
+    q.set_defaults(fn=cmd_logout, sync=True)
+
+    q = sub.add_parser("status", help="статус авторизации")
+    q.set_defaults(fn=cmd_status, sync=True)
+
+    q = sub.add_parser("config", help="настройки (показать/прочитать/записать)")
+    q.add_argument("key", nargs="?")
+    q.add_argument("value", nargs="?")
+
+    # ---- общие параметры фильтрации сообщений
+    mf = argparse.ArgumentParser(add_help=False)
+    mf.add_argument("-l", "--last", type=int, default=None,
+                    help="сколько последних сообщений (по умолчанию 20)")
+    mf.add_argument("-a", "--all", action="store_true", help="вообще все сообщения")
+    mf.add_argument("--ids", type=int, nargs="+", metavar="ID",
+                    help="конкретные id сообщений")
+    mf.add_argument("-f", "--from", dest="from_", metavar="NAME",
+                    help="от кого (@user, id, 'me' или часть имени)")
+    mf.add_argument("-m", "--mine", action="store_true", help="только мои сообщения")
+    mf.add_argument("--incoming", action="store_true", help="только чужие")
+    mf.add_argument("--search", metavar="TEXT", help="поиск текста внутри чата")
+    mf.add_argument("-s", "--since", metavar="WHEN",
+                    help="начиная с: 2026-10-22, '2026-10-22 10:00', 3d, 2w, 5ч, yesterday")
+    mf.add_argument("-u", "--until", metavar="WHEN", help="до указанной даты")
+    mf.add_argument("-t", "--type", metavar="TYPE",
+                    help="фото: photo, video, doc, voice, audio, gif, round, url, sticker")
+
+    # ---- профили
+    sub.add_parser("me", help="инфа о себе").set_defaults(fn=cmd_me)
+    q = sub.add_parser("user", help="инфа о пользователе/канале/группе")
+    q.add_argument("who", metavar="USER|ID|@USER|t.me-ссылка|часть_имени")
+    sub.add_parser("contacts", help="список контактов").set_defaults(fn=cmd_contacts)
+
+    # ---- чаты
+    q = sub.add_parser("chats", aliases=["ls"], help="список чатов")
+    q.add_argument("--limit", type=int, default=50, metavar="N")
+    q.add_argument("-A", "--all", action="store_true", help="все чаты")
+    q.add_argument("--unread", action="store_true", help="только с непрочитанными")
+    q.add_argument("--type", choices=["u", "g", "c", "b"],
+                   help="u=личные, g=группы, c=каналы, b=боты")
+    q.add_argument("--json", action="store_true")
+
+    # ---- чтение
+    q = sub.add_parser("read", aliases=["r"], help="читать сообщения чата",
+                       parents=[mf])
+    q.add_argument("chat", help="имя / @user / id / 'me' (избранное)")
+    q.add_argument("--ids-only", action="store_true", help="вывести только id")
+    q.add_argument("--json", action="store_true")
+    q.add_argument("--raw", action="store_true",
+                   help="показать текст сырым markdown'ом (без ANSI-стилей)")
+
+    # ---- поиск
+    q = sub.add_parser("search", help="поиск сообщений")
+    q.add_argument("query", nargs="+", help="текст запроса")
+    q.add_argument("-c", "--chat", help="чат (не указывать — глобальный поиск)")
+    q.add_argument("-l", "--limit", type=int, default=30)
+    q.add_argument("--deep", action="store_true",
+                   help="глобальный поиск по всем чатам (медленно)")
+    q.add_argument("--json", action="store_true")
+    q.add_argument("--ids-only", action="store_true")
+    q.add_argument("--raw", action="store_true")
+
+    # ---- отправка
+    q = sub.add_parser("send", aliases=["s"], help="отправить сообщение/файл")
+    q.add_argument("chat")
+    q.add_argument("text", nargs="*", help="текст; без текста и файла — читается stdin")
+    q.add_argument("-F", "--file", metavar="PATH", help="отправить файл")
+    q.add_argument("-p", "--photo", action="store_true",
+                   help="править как фото (сжать), а не документ")
+    q.add_argument("--reply", type=int, metavar="ID", help="ответ на сообщение")
+    q.add_argument("--silent", action="store_true", help="без звука уведомления")
+    q.add_argument("--plain", action="store_true", help="без markdown-разметки")
+    q.add_argument("--html", action="store_true", help="HTML-разметка")
+    q.add_argument("--button", action="append", metavar="ТЕКСТ|URL",
+                   help="кнопка: 'Подписаться|https://...' (url-кнопка) "
+                        "или 'Вариант' (текстовая reply-кнопка); повтори для ряда")
+
+    q = sub.add_parser("reply", help="быстрый ответ на сообщение")
+    q.add_argument("chat"); q.add_argument("id", type=int)
+    q.add_argument("text", nargs="*")
+    q.add_argument("--silent", action="store_true")
+    q.add_argument("--button", action="append", metavar="ТЕКСТ|URL")
+    q.add_argument("--raw", action="store_true")
+
+    q = sub.add_parser("edit", help="редактировать своё сообщение")
+    q.add_argument("chat"); q.add_argument("id", type=int); q.add_argument("text", nargs="+")
+
+    q = sub.add_parser("delete", aliases=["rm"], help="удалить сообщения")
+    q.add_argument("chat")
+    q.add_argument("ids", type=int, nargs="*", metavar="ID")
+    q.add_argument("-l", "--last", type=int, metavar="N", help="последние N")
+    q.add_argument("-m", "--mine", action="store_true", help="только свои")
+    q.add_argument("--recover", action="store_true",
+                   help="удалить только у себя (без revoke)")
+    q.add_argument("-y", "--yes", action="store_true", help="без подтверждения")
+
+    # ---- файлы
+    q = sub.add_parser("push", aliases=["upload"], help="отправить файлы в чат")
+    q.add_argument("chat"); q.add_argument("files", nargs="+")
+    q.add_argument("-c", "--caption", nargs="*", help="подпись")
+    q.add_argument("-p", "--as-photo", action="store_true", help="сжать как фото")
+    q.add_argument("--reply", type=int, metavar="ID")
+    q.add_argument("--silent", action="store_true")
+    q.add_argument("-y", "--yes", action="store_true")
+
+    q = sub.add_parser("pull", aliases=["download", "dl"], parents=[mf],
+                       help="скачать медиа/файлы из чата")
+    q.add_argument("chat")
+    q.add_argument("-d", "--dest", metavar="DIR", help="куда (по умолчанию из tgu config)")
+    q.add_argument("-n", "--dry-run", action="store_true", help="только показать список")
+
+    # ---- кнопки
+    q = sub.add_parser("click", help="нажать кнопку у сообщения "
+                                     "(номер от 0 или текст кнопки)")
+    q.add_argument("chat")
+    q.add_argument("id", type=int)
+    q.add_argument("button", help="номер или текст кнопки (можно частично)")
+
+    # ---- прочее
+    q = sub.add_parser("forward", aliases=["fw"], help="переслать сообщения")
+    q.add_argument("chat"); q.add_argument("ids", type=int, nargs="+")
+    q.add_argument("--to", required=True, help="куда переслать")
+
+    q = sub.add_parser("mark", help="отметить чат прочитанным")
+    q.add_argument("chat")
+    q.add_argument("--up-to", type=int, metavar="ID", help="до какого id")
+
+    q = sub.add_parser("pin", help="закрепить сообщение")
+    q.add_argument("chat"); q.add_argument("id", type=int)
+    q.add_argument("--notify", action="store_true")
+
+    q = sub.add_parser("unpin", help="открепить (последнее или по id)")
+    q.add_argument("chat"); q.add_argument("id", type=int, nargs="?")
+
+    q = sub.add_parser("help", help="справка по команде")
+    q.add_argument("topic", nargs="?")
+    return ap
+
+
+EXAMPLES = """
+  tgu login                                   # вход (телефон + код)
+  tgu chats --unread                          # чаты с непрочитанными
+  tgu read Друзья -l 30                       # последние 30 сообщений
+  tgu read "Работа" --from @vasya --since 3d  # от Васи за 3 дня
+  tgu read me -l 5                            # избранное (saved messages)
+  tgu send Друзья Привет! Как дела?           # отправить текст
+  tgu send Друзья --file foto.jpg --photo     # отправить фото с жатием
+  tgu push Друзья file1.pdf file2.zip         # отправить файлы
+  tgu pull Друзья --type photo -l 50          # скачать фото из чата
+  tgu pull Друзья --since yesterday -d ~/dl   # скачать с вчерашнего дня
+  tgu search встреча --chat Друзья            # найти 'встреча' в чате
+  tgu search встреча --deep                   # во всех чатах
+  tgu click "Бот" 123 Подписаться             # нажать кнопку (номер или текст)
+  tgu send Друзья Привет! --button "Сайт|https://example.com"
+  tgu click "Бот" 1235 Подписаться            # нажать кнопку у сообщения
+  tgu send Друзья Привет --button "Сайт|https://example.com"
+  tgu user @durov                             # инфа о пользователе
+  tgu delete Друзья 1234 1235 --mine          # удалить свои сообщения
+  tgu forward Друзья 1234 --to Друг           # переслать сообщение
+  tgu mark Друзья                             # все прочитано
+"""
+
+
+ALIASES = {"ls": "chats", "r": "read", "s": "send", "msg": "send",
+           "msgs": "read", "upload": "push", "download": "pull",
+           "dl": "pull", "rm": "delete", "fw": "forward"}
+
+FNS = {"me": cmd_me, "user": cmd_user, "contacts": cmd_contacts,
+       "chats": cmd_chats, "read": cmd_read, "search": cmd_search,
+       "send": cmd_send, "reply": cmd_reply, "edit": cmd_edit,
+       "delete": cmd_delete, "push": cmd_push, "pull": cmd_pull,
+       "forward": cmd_forward, "mark": cmd_mark, "pin": cmd_pin,
+       "unpin": cmd_unpin, "click": cmd_click}
+
+
+def human_time(s):
+    if not s:
+        return "некоторое время"
+    if s < 60:
+        return "%d сек" % s
+    if s < 3600:
+        return "%d мин" % (s // 60)
+    return "%d ч %d мин" % (s // 3600, s % 3600 // 60)
+
+
+def main():
+    argv = list(sys.argv[1:])
+    if argv and argv[0] in ALIASES:
+        argv[0] = ALIASES[argv[0]]
+    if argv and argv[0] in ("-h", "--help", "help"):
+        if len(argv) > 1 and argv[1] in ALIASES:
+            argv[1] = ALIASES[argv[1]]
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    if getattr(args, "no_color", False):
+        os.environ["NO_COLOR"] = "1"
+    if not getattr(args, "cmd", None):
+        ap.print_help()
+        return 0
+
+    if args.cmd == "config":
+        CFG_DIR.mkdir(parents=True, exist_ok=True)
+        cfg = load_cfg()
+        if not args.key:
+            print(json.dumps(cfg, ensure_ascii=False, indent=2)); return 0
+        if args.value is None:
+            print(cfg.get(args.key, "")); return 0
+        cfg[args.key] = args.value; save_cfg(cfg)
+        print(green("✓ %s = %s" % (args.key, args.value))); return 0
+
+    if args.cmd in FNS:
+        args.fn = FNS[args.cmd]
+    if not getattr(args, "fn", None):
+        if getattr(args, "topic", None):
+            topic = ALIASES.get(args.topic, args.topic)
+            ap.parse_args([topic, "--help"])
+        else:
+            ap.print_help()
+        return 0
+
+    if getattr(args, "sync", False):
+        args.fn(args)
+        return 0
+
+    client = build_client()
+    if not SESSION_DB.exists():
+        die("нет сессии — запусти: tgu login")
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(client.connect())
+        if not loop.run_until_complete(client.is_user_authorized()):
+            die("сессия истекла/не авторизована — запусти: tgu login")
+        loop.run_until_complete(args.fn(client, args))
+    except FloodError as e:
+        secs = getattr(e, "seconds", None) or (e.value if isinstance(e, object) else None)
+        die("флуд-лимит: подожди %s" % human_time(getattr(e, "seconds", None)))
+    except RPCError as e:
+        die("ошибка Telegram: %s" % e)
+    except (KeyboardInterrupt, EOFError):
+        print(); sys.exit(130)
+    finally:
+        try:
+            shutdown(client)
+        except Exception:
+            pass
+        loop.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
