@@ -12,7 +12,7 @@ cd ~/projects/tgu
 ```
 
 Зависимость `telethon` уже установлена в этом окружении.
-Если нет: `pip install telethon`.
+Если нет: `pip install telethon`. Для «богатых» постов (rich_message) нужен Telethon ≥ 1.45.
 
 ## Первый запуск (вход в аккаунт)
 
@@ -61,6 +61,12 @@ tgu login
 | `tgu mark <chat>` | отметить прочитанным |
 | `tgu pin/unpin <chat> [id]` | закрепить/открепить |
 | `tgu config [ключ] [знач]` | настройки (напр. `download_dir`) |
+| `tgu app @bot` | инфа о миниаппе/вебаппе бота (меню-кнопка, ссылки, команды, app settings) |
+| `tgu similar <строка>` | поиск похожих юзеров/ботов/каналов |
+| `tgu estdate <id>` | примерная дата регистрации по user_id (интерполяция) |
+| `tgu intel <кто>` | сводка: id, оценка регистрации, флаги, общие чаты |
+| `tgu react <chat> <id> [👍]` | поставить/убрать реакцию ('clear' — убрать) |
+| `tgu link <chat> [id]` | t.me-ссылка на чат и/или сообщение |
 
 Короткие алиасы: `ls`=chats, `r`=read, `s`/`msg`=send, `msgs`=read,
 `upload`=push, `download`/`dl`=pull, `rm`=delete, `fw`=forward.
@@ -106,6 +112,12 @@ tgu send Друзья "Выдели меня" --button "Да" --button "Нет" 
 tgu delete Друзья 1234 1235 --mine -y       # удалить свои
 tgu forward Работа 1234 --to Друг           # переслать
 tgu mark Друзья                             # всё прочитано
+tgu app @uvashenie_bot                      # инфа о миниаппе/вебаппе бота
+tgu similar uvashenie                       # похожие юзеры/боты/каналы
+tgu estdate 9139634192                      # примерная дата регистрации по id
+tgu intel @itz_rival                        # сводка по юзеру
+tgu react Друзья 1234 👍                     # поставить реакцию
+tgu link Друзья 1234                        # t.me-ссылка на сообщение
 ```
 
 ### Настройки

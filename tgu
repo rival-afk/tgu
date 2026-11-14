@@ -35,7 +35,7 @@ from telethon.tl.types import (
 )
 
 PROG = "tgu"
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 
 HOME = Path.home()
 CFG_DIR = Path(os.environ.get("TGU_HOME", str(HOME / ".config" / "tgu")))
@@ -1160,6 +1160,280 @@ async def cmd_reply(client, args):
     p(green("✓ отправлено ") + dim("[%d] как ответ на %d" % (msg.id, args.id)))
 
 
+async def cmd_app(client, args):
+    """Инфа о миниаппе / веб-аппе бота (из bot_info)."""
+    ent = await resolve(client, args.bot)
+    if not getattr(ent, "bot", False):
+        die("%s — не бот" % args.bot)
+    full = None
+    try:
+        full = await client(GetFullUserRequest(ent))
+    except Exception as e:
+        warn("детали не получены: %s" % e)
+    p(bold(entity_name(ent)) + dim("  [бот, id %s]" % ent.id))
+    uname = getattr(ent, "username", None)
+    about = getattr(full.full_user, "about", None) if full else None
+    if about:
+        p("о боте:     " + about)
+    info = getattr(full.full_user, "bot_info", None) if full else None
+    if info:
+        if info.description:
+            p("описание:   " + info.description)
+        if info.description_photo is not None:
+            p("описание+:  есть фото в описании (Telethon: description_photo)")
+        mb = getattr(info, "menu_button", None)
+        if mb is not None and getattr(mb, "url", None):
+            p("меню-кнопка:")
+            p("  %s → %s" % (getattr(mb, "text", None) or "меню", mb.url))
+        elif mb is not None:
+            p("меню-кнопка: " + type(mb).__name__.replace("BotMenuButton", "").lower()
+              + " (команды или по умолчанию)")
+        app_settings = getattr(info, "app_settings", None)
+        if app_settings is not None:
+            p("app settings:")
+            for k in ("background_color", "background_dark_color",
+                      "header_color", "header_dark_color"):
+                v = getattr(app_settings, k, None)
+                if v is not None:
+                    p("  %-20s #%06x" % (k, v & 0xFFFFFF))
+            if app_settings.placeholder_path:
+                p("  %-20s есть (заглушка-изображение, %d байт)" %
+                  ("placeholder", len(app_settings.placeholder_path)))
+        if info.commands:
+            p("команды:")
+            for c in info.commands:
+                p("  /%-16s %s" % (c.command, c.description))
+        if getattr(info, "privacy_policy_url", None):
+            p("политика:    " + info.privacy_policy_url)
+    if uname:
+        p("")
+        p("ссылки:")
+        p("  запустить бота:   https://t.me/%s" % uname)
+        p("  главный mini app: https://t.me/%s?startapp=" % uname)
+        p(dim("  если знаешь short_name приложения: https://t.me/%s/<short_name>?startapp=" % uname))
+
+
+async def cmd_react(client, args):
+    """Поставить/убрать реакцию у сообщения."""
+    from telethon.tl.functions.messages import SendReactionRequest
+    from telethon.tl.types import ReactionEmoji
+    ent = await resolve(client, args.chat)
+    emo = (args.emoji or "👍").strip()
+    if emo.lower() in ("-", "clear", "none", "нет", "убрать", "отменить"):
+        reaction = []
+        what = "убрана"
+    else:
+        reaction = [ReactionEmoji(emoticon=emo)]
+        what = "поставлена"
+    try:
+        await client(SendReactionRequest(
+            peer=ent, msg_id=args.id, reaction=reaction,
+            big=args.big, add_to_recent=None))
+        p(green("✓ реакция %s" % what) + dim(" [сообщение %d]" % args.id))
+    except RPCError as e:
+        die("реакция не отправлена: %s" % e)
+
+
+async def cmd_link(client, args):
+    """t.me-ссылка на чат/сообщение."""
+    ent = await resolve(client, args.chat)
+    mid = args.id
+    uname = getattr(ent, "username", None)
+    cid = getattr(ent, "id", None)
+    if uname:
+        url = "https://t.me/%s" % uname
+    elif cid is not None:
+        s = str(cid)
+        if s.startswith("-100"):
+            url = "https://t.me/c/%s" % s[4:]
+        elif s.startswith("-"):
+            die("это старый group-id — возьми username из `tgu chats`")
+        else:
+            die("у %s нет публичного юзернейма — ссылка возможна только с @username"
+                % entity_name(ent))
+    if mid:
+        url += "/%d" % mid
+    print(url)
+
+
+# ───────────────────────────── разведка / оценка по id ─────────────────────────────
+
+# Публичные якоря: номер user_id → ориентировочная дата появления id в системе.
+# Пользовательские id раздаются почти последовательно, поэтому дату регистрации
+# оценивают интерполяцией. Погрешность — от нескольких недель до месяцев.
+_ID_ANCHORS = [
+    (1,                 dt.datetime(2014, 10, 30, tzinfo=dt.timezone.utc)),
+    (50_000_000,        dt.datetime(2015, 6, 1,  tzinfo=dt.timezone.utc)),
+    (100_000_000,       dt.datetime(2016, 1, 15, tzinfo=dt.timezone.utc)),
+    (200_000_000,       dt.datetime(2016, 8, 1,  tzinfo=dt.timezone.utc)),
+    (400_000_000,       dt.datetime(2017, 8, 1,  tzinfo=dt.timezone.utc)),
+    (700_000_000,       dt.datetime(2018, 8, 1,  tzinfo=dt.timezone.utc)),
+    (1_000_000_000,     dt.datetime(2019, 5, 1,  tzinfo=dt.timezone.utc)),
+    (1_300_000_000,     dt.datetime(2019, 11, 1, tzinfo=dt.timezone.utc)),
+    (1_700_000_000,     dt.datetime(2020, 4, 1,  tzinfo=dt.timezone.utc)),
+    (2_100_000_000,     dt.datetime(2020, 9, 1,  tzinfo=dt.timezone.utc)),
+    (2_800_000_000,     dt.datetime(2021, 3, 1,  tzinfo=dt.timezone.utc)),
+    (3_700_000_000,     dt.datetime(2021, 8, 1,  tzinfo=dt.timezone.utc)),
+    (4_200_000_000,     dt.datetime(2021, 11, 1, tzinfo=dt.timezone.utc)),
+    (4_800_000_000,     dt.datetime(2022, 4, 1,  tzinfo=dt.timezone.utc)),
+    (5_400_000_000,     dt.datetime(2022, 9, 1,  tzinfo=dt.timezone.utc)),
+    (6_000_000_000,     dt.datetime(2023, 3, 1,  tzinfo=dt.timezone.utc)),
+    (6_700_000_000,     dt.datetime(2023, 9, 1,  tzinfo=dt.timezone.utc)),
+    (7_300_000_000,     dt.datetime(2024, 2, 1,  tzinfo=dt.timezone.utc)),
+    (7_800_000_000,     dt.datetime(2024, 7, 1,  tzinfo=dt.timezone.utc)),
+    (8_200_000_000,     dt.datetime(2024, 11, 1, tzinfo=dt.timezone.utc)),
+    (8_600_000_000,     dt.datetime(2025, 3, 1,  tzinfo=dt.timezone.utc)),
+    (8_900_000_000,     dt.datetime(2025, 6, 1,  tzinfo=dt.timezone.utc)),
+    (9_200_000_000,     dt.datetime(2025, 10, 1, tzinfo=dt.timezone.utc)),
+    (9_400_000_000,     dt.datetime(2026, 2, 1,  tzinfo=dt.timezone.utc)),
+    (9_600_000_000,     dt.datetime(2026, 7, 1,  tzinfo=dt.timezone.utc)),
+]
+
+
+def est_reg_date(uid):
+    """Примерная дата появления user_id (кусочно-линейная интерполяция)."""
+    uid = abs(int(uid))
+    if uid <= 0:
+        return None
+    a = _ID_ANCHORS
+    if uid <= a[0][0]:
+        return a[0][1]
+    for i in range(1, len(a)):
+        if uid <= a[i][0]:
+            id0, t0 = a[i - 1]
+            id1, t1 = a[i]
+            frac = (uid - id0) / float(id1 - id0)
+            return t0 + (t1 - t0) * frac
+    id0, t0 = a[-1]
+    return t0 + dt.timedelta(days=(uid - id0) // 1500)  # экстраполяция вперёд
+
+
+async def cmd_similar(client, args):
+    """Поиск похожих юзеров/ботов/каналов по подстроке."""
+    from telethon.tl.functions.contacts import SearchRequest
+    q0 = args.query.strip().lstrip("@")
+    if not q0:
+        die("пустой запрос")
+    # варианты написания: как есть, без цифр/подчёркиваний, части
+    variants = []
+    for v in (q0, re.sub(r"\d+$", "", q0), re.sub(r"[_\-]+", "", q0),
+              q0.replace("_", " ")):
+        v = v.strip()
+        if v and v.lower() not in [x.lower() for x in variants]:
+            variants.append(v)
+    seen = {}
+    lim = args.limit
+    for v in variants:
+        try:
+            res = await client(SearchRequest(q=v, limit=lim))
+        except Exception as e:
+            warn("поиск %r не удался: %s" % (v, e))
+            continue
+        for u in getattr(res, "users", None) or []:
+            seen[("u", u.id)] = u
+        for c in getattr(res, "chats", None) or []:
+            seen[("c", c.id)] = c
+    if not seen:
+        p("ничего похожего не нашлось")
+        return
+    items = sorted(seen.values(), key=lambda e: (getattr(e, "title", None) or
+                   entity_name(e)).lower())
+    est = []
+    for e in items:
+        d = est_reg_date(e.id)
+        marks = []
+        if getattr(e, "bot", False):
+            marks.append("бот")
+        if getattr(e, "verified", False):
+            marks.append("verified")
+        if getattr(e, "scam", False):
+            marks.append("SCAM")
+        if getattr(e, "fake", False):
+            marks.append("FAKE")
+        if getattr(e, "premium", False):
+            marks.append("premium")
+        uname = "@" + e.username
+        p("%-28s %-28s id %-12s %s" % (
+            bold(entity_name(e)[:27]),
+            dim(uname if getattr(e, "username", None) else "-"),
+            str(e.id),
+            dim("~%s %s" % (d.strftime("%Y-%m-%d") if d else "?",
+                            ("(" + ", ".join(marks) + ")") if marks else ""))))
+
+
+async def cmd_estdate(client, args):
+    """Примерная дата регистрации аккаунта по его user_id."""
+    if T_INT.fullmatch(args.user):
+        uid = int(args.user)
+        uname = None
+    else:
+        ent = await resolve(client, args.user)
+        if not getattr(ent, "bot", False) and not isinstance(ent, tl.User):
+            die("по id оценивается дата только у пользовательских аккаунтов/ботов")
+        uid, uname = ent.id, getattr(ent, "username", None)
+    d = est_reg_date(uid)
+    if not d:
+        die("некорректный id")
+    days = (dt.datetime.now(dt.timezone.utc) - d).days
+    ago = "%d г. %d мес" % (days // 365, (days % 365) // 30) if days >= 365 else \
+          ("%d мес" % (days // 30) if days >= 30 else "%d дн" % days)
+    p("id:            %s%s" % (uid, "  (@%s)" % uname if uname else ""))
+    p("регистрация ~ %s  (примерно %s назад)" % (d.strftime("%d.%m.%Y"), ago))
+    p(dim("оценка по публичным якорям user_id, погрешность — до нескольких месяцев"))
+
+
+async def cmd_intel(client, args):
+    """Сводка по пользователю: id, оценка регистрации, флаги, общие чаты."""
+    ent = await resolve(client, args.who)
+    name = entity_name(ent)
+    typ = "пользователь"
+    if getattr(ent, "bot", False):
+        typ = "бот"
+    elif isinstance(ent, (tl.Channel, tl.Chat)):
+        typ = "канал" if isinstance(ent, tl.Channel) and not getattr(ent, "megagroup", False) else "группа"
+    p(bold(name) + dim("  [%s, id %s]" % (typ, ent.id)))
+    uname = getattr(ent, "username", None)
+    if uname:
+        p("username:    @%s" % uname)
+        p("ссылка:      https://t.me/%s" % uname)
+    if uname:
+        pass
+    try:
+        full = None
+        if isinstance(ent, tl.User):
+            full = await client(GetFullUserRequest(ent))
+            fu = full.full_user
+            if getattr(fu, "common_chats_count", None):
+                p("общих чатов: %s" % fu.common_chats_count)
+            if getattr(fu, "about", None):
+                p("о себе:     " + fu.about)
+        elif isinstance(ent, tl.Channel):
+            full = await client(GetFullChannelRequest(ent))
+            fc = full.full_chat
+            if getattr(fc, "participants_count", None):
+                p("участников: %s" % fc.participants_count)
+            if getattr(fc, "about", None):
+                p("о канале:   " + fc.about)
+    except Exception as e:
+        warn("детали не получены: %s" % e)
+    if isinstance(ent, tl.User):
+        d = est_reg_date(ent.id)
+        if d:
+            p("регистрация ~ %s (оценка)" % d.strftime("%d.%m.%Y"))
+        if getattr(ent, "verified", False):
+            p("verified:    да")
+        if getattr(ent, "premium", False):
+            p("premium:     да")
+        if getattr(ent, "scam", False):
+            p(red("SCAM"))
+        if getattr(ent, "fake", False):
+            p(red("FAKE"))
+        if getattr(ent, "restricted", False):
+            p("ограничен:   да")
+        if not getattr(ent, "bot", False):
+            p("статус:      " + status_text(getattr(ent, "status", None)))
+
+
 # ───────────────────────────── argparse ─────────────────────────────
 
 def build_parser():
@@ -1205,11 +1479,24 @@ def build_parser():
     mf.add_argument("-t", "--type", metavar="TYPE",
                     help="фото: photo, video, doc, voice, audio, gif, round, url, sticker")
 
+    # ---- разведка
+    q = sub.add_parser("similar", help="поиск похожих юзеров/ботов/каналов по подстроке")
+    q.add_argument("query", help="строка (имя/часть юзернейма)")
+    q.add_argument("-l", "--limit", type=int, default=20, metavar="N")
+    q = sub.add_parser("estdate", help="примерная дата регистрации по user_id")
+    q.add_argument("user", help="id или @username / имя")
+    q = sub.add_parser("intel", help="сводка по пользователю: id, оценка регистрации, флаги")
+    q.add_argument("who", metavar="USER|ID|@USER|часть_имени")
+
     # ---- профили
     sub.add_parser("me", help="инфа о себе").set_defaults(fn=cmd_me)
     q = sub.add_parser("user", help="инфа о пользователе/канале/группе")
     q.add_argument("who", metavar="USER|ID|@USER|t.me-ссылка|часть_имени")
     sub.add_parser("contacts", help="список контактов").set_defaults(fn=cmd_contacts)
+    q = sub.add_parser("app", aliases=["miniapp"],
+                       help="инфа о миниаппе/вебаппе бота (команды, меню-кнопка, ссылки)")
+    q.add_argument("bot", help="бот: @username / id / часть_имени")
+    q.set_defaults(fn=cmd_app)
 
     # ---- чаты
     q = sub.add_parser("chats", aliases=["ls"], help="список чатов")
@@ -1297,6 +1584,17 @@ def build_parser():
     q.add_argument("button", help="номер или текст кнопки (можно частично)")
 
     # ---- прочее
+    q = sub.add_parser("react", help="поставить/убрать реакцию у сообщения")
+    q.add_argument("chat")
+    q.add_argument("id", type=int)
+    q.add_argument("emoji", nargs="?", metavar="ЭМОДЗИ",
+                   help="эмодзи; 'clear' — убрать реакцию; по умолчанию 👍")
+    q.add_argument("--big", action="store_true", help="большая анимированная реакция")
+
+    q = sub.add_parser("link", help="t.me-ссылка на чат и/или сообщение")
+    q.add_argument("chat")
+    q.add_argument("id", type=int, nargs="?", metavar="ID")
+
     q = sub.add_parser("forward", aliases=["fw"], help="переслать сообщения")
     q.add_argument("chat"); q.add_argument("ids", type=int, nargs="+")
     q.add_argument("--to", required=True, help="куда переслать")
@@ -1330,6 +1628,13 @@ EXAMPLES = """
   tgu pull Друзья --since yesterday -d ~/dl   # скачать с вчерашнего дня
   tgu search встреча --chat Друзья            # найти 'встреча' в чате
   tgu search встреча --deep                   # во всех чатах
+  tgu app @uvashenie_bot                      # инфа о миниаппе/вебаппе бота
+  tgu similar uvashenie                       # найти похожих юзеров/ботов
+  tgu estdate @uvashenie_bot                  # примерная дата регистрации по id
+  tgu intel @uvashenie_bot                    # сводка: id, регистрация, флаги
+  tgu react Друзья 1234 👍                     # поставить реакцию
+  tgu react Друзья 1234 clear                 # убрать реакцию
+  tgu link Друзья 1234                        # t.me-ссылка на сообщение
   tgu click "Бот" 123 Подписаться             # нажать кнопку (номер или текст)
   tgu send Друзья Привет! --button "Сайт|https://example.com"
   tgu click "Бот" 1235 Подписаться            # нажать кнопку у сообщения
@@ -1346,11 +1651,14 @@ ALIASES = {"ls": "chats", "r": "read", "s": "send", "msg": "send",
            "dl": "pull", "rm": "delete", "fw": "forward"}
 
 FNS = {"me": cmd_me, "user": cmd_user, "contacts": cmd_contacts,
+       "app": cmd_app, "similar": cmd_similar, "estdate": cmd_estdate,
+       "intel": cmd_intel,
        "chats": cmd_chats, "read": cmd_read, "search": cmd_search,
        "send": cmd_send, "reply": cmd_reply, "edit": cmd_edit,
        "delete": cmd_delete, "push": cmd_push, "pull": cmd_pull,
        "forward": cmd_forward, "mark": cmd_mark, "pin": cmd_pin,
-       "unpin": cmd_unpin, "click": cmd_click}
+       "unpin": cmd_unpin, "click": cmd_click, "react": cmd_react,
+       "link": cmd_link}
 
 
 def human_time(s):
