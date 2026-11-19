@@ -62,6 +62,7 @@ tgu login
 | `tgu pin/unpin <chat> [id]` | закрепить/открепить |
 | `tgu config [ключ] [знач]` | настройки (напр. `download_dir`) |
 | `tgu app @bot` | инфа о миниаппе/вебаппе бота (меню-кнопка, ссылки, команды, app settings) |
+| `tgu webview @bot [short_name]` | полный URL web view (с токеном) + хост и его IP (A/AAAA) |
 | `tgu similar <строка>` | поиск похожих юзеров/ботов/каналов |
 | `tgu estdate <id>` | примерная дата регистрации по user_id (интерполяция) |
 | `tgu intel <кто>` | сводка: id, оценка регистрации, флаги, общие чаты |
@@ -127,5 +128,25 @@ tgu config                       # показать всё
 tgu config download_dir /путь    # куда складывать pull (по умолчанию ~/tgu-downloads)
 ```
 
+## tgu-mcp — MCP-сервер поверх этого же аккаунта
+
+В каталоге `mcp/` лежит `tgu_mcp.py` — MCP-сервер (stdio), показывающий MCP-клиенту
+20 инструментов поверх утилиты: `chats`, `read`, `read_ids`, `user`, `me`, `status`,
+`search`, `similar`, `intel`, `estdate`, `app`, `webview`, `link`,
+`send`, `reply`, `delete`, `react`, `mark_read`, `forward`, `pull`.
+
+Требования: Python ≥ 3.11, пакет `mcp` (`pip install mcp`).
+
+```sh
+opencode mcp add tgu --global -- python3 ~/projects/tgu/mcp/tgu_mcp.py
+# или любой другой MCP-клиент: запуск `python3 ~/projects/tgu/mcp/tgu_mcp.py`, транспорт stdio
+```
+
+Состояние меняют только `send`, `reply`, `delete`, `react`, `mark_read`, `forward`, `pull` —
+они помечены как destructive и требуют явного согласия пользователя; остальные инструменты — read-only.
+Переменные окружения: `TGU` (путь к бинарю), `TGU_ARGS`, `TGU_MCP_TIMEOUT` (сек, по умолчанию 120).
+
 Безопасность: сессия — обычный Telethon-логин, сервер ничего не видит
 стороннего; выход делает `tgu logout` (удаляет сессию и на сервере).
+`tgu webview @bot` печатает URL со встроенным auth-токеном миниаппа — этот токен
+привязывает web-сессию к твоему аккаунту вплоть до истечения; не показывай его чужим.
