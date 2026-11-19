@@ -35,7 +35,7 @@ from telethon.tl.types import (
 )
 
 PROG = "tgu"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 HOME = Path.home()
 CFG_DIR = Path(os.environ.get("TGU_HOME", str(HOME / ".config" / "tgu")))
@@ -421,13 +421,28 @@ def btn_rows(msg):
     for row in rows:
         cells = []
         for b in row.buttons:
-            if isinstance(b, tl.KeyboardButtonUrl):
-                cells.append(cyan(b.text) + dim("(🔗 %s)" % (b.url[:40])))
-            elif isinstance(b, tl.KeyboardButtonCallback) or \
-                    type(b).__name__ == "KeyboardButtonCallback":
-                cells.append(bold(b.text) + dim("(кнопка)"))
-            elif hasattr(b, "text"):
-                cells.append(str(b.text))
+            if isinstance(b, tl.KeyboardInlineButton):
+                typ = b.type
+                if isinstance(typ, tl.InlineButtonTypeUrl):
+                    cells.append(cyan(b.text) + dim("(🔗 %s)" % (typ.url[:40])))
+                elif isinstance(typ, tl.InlineButtonTypeWebView):
+                    cells.append(cyan(b.text) + dim("(webview %s)" % (typ.url[:40])))
+                elif isinstance(typ, tl.InlineButtonTypeCallback):
+                    cells.append(bold(b.text) + dim("(кнопка)"))
+                elif isinstance(typ, tl.InlineButtonTypeCopy):
+                    cells.append(bold(b.text) + dim("(копировать)"))
+                else:
+                    cells.append(str(b.text))
+            elif isinstance(b, tl.KeyboardButton):
+                typ = getattr(b, "type", None)
+                lab = b.text
+                if isinstance(typ, tl.ButtonTypeRequestPhone):
+                    lab = b.text + " (📱)"
+                elif isinstance(typ, tl.ButtonTypeRequestGeoLocation):
+                    lab = b.text + " (📍)"
+                elif isinstance(typ, tl.ButtonTypeRequestPoll):
+                    lab = b.text + " (опрос)"
+                cells.append(str(lab))
             else:
                 cells.append(dim(type(b).__name__))
         if cells:
@@ -436,15 +451,22 @@ def btn_rows(msg):
 
 
 def _btn_kind(b):
-    if isinstance(b, tl.KeyboardButtonUrl):
-        return {"text": b.text, "kind": "url", "url": b.url}
-    if type(b).__name__ == "KeyboardButtonCallback":
-        data = getattr(b, "data", b"")
-        try:
-            data = data.decode("utf-8", "replace")
-        except Exception:
-            pass
-        return {"text": b.text, "kind": "callback", "data": data}
+    if isinstance(b, tl.KeyboardInlineButton):
+        typ = b.type
+        if isinstance(typ, tl.InlineButtonTypeUrl):
+            return {"text": b.text, "kind": "url", "url": typ.url}
+        if isinstance(typ, tl.InlineButtonTypeWebView):
+            return {"text": b.text, "kind": "webview", "url": typ.url}
+        if isinstance(typ, tl.InlineButtonTypeCallback):
+            data = getattr(typ, "data", b"")
+            try:
+                data = data.decode("utf-8", "replace")
+            except Exception:
+                pass
+            return {"text": b.text, "kind": "callback", "data": data}
+        return {"text": b.text, "kind": type(typ).__name__.replace("InlineButtonType", "").lower()}
+    if isinstance(b, tl.KeyboardButton):
+        return {"text": b.text, "kind": "reply"}
     return {"text": getattr(b, "text", None), "kind": type(b).__name__}
 
 
@@ -921,28 +943,33 @@ def build_markup(args):
     if not specs:
         return None
     kb = []
+    url_buttons = []
+    text_buttons = []
     for spec in specs:
         if "|" in spec:
             text, url = spec.split("|", 1)
             if not url:
                 die("кнопка %r: пустой url (формат 'ТЕКСТ|URL')" % spec)
-            kb.append(tl.KeyboardButtonUrl(text=text.strip() or url, url=url))
+            url_buttons.append(tl.KeyboardInlineButton(
+                text=text.strip() or url,
+                type=tl.InlineButtonTypeUrl(url=url), style=None))
         else:
             text = spec.strip()
             if not text:
                 die("пустая кнопка")
-            kb.append(tl.KeyboardButton(text=text))
-    if any(isinstance(b, tl.KeyboardButtonUrl) for b in kb) and \
-            any(isinstance(b, tl.KeyboardButton) for b in kb):
+            text_buttons.append(tl.KeyboardButton(
+                text=text, type=tl.ButtonTypeDefault(), style=None))
+    if url_buttons and text_buttons:
         die("смешивать url-кнопки и текстовые в одном сообщении нельзя — "
             "используй два сообщения")
-    if kb and isinstance(kb[0], tl.KeyboardButton):
-        return tl.ReplyKeyboardMarkup(rows=[tl.KeyboardButtonRow(buttons=kb)],
-                                      resize=True)
+    if text_buttons:
+        return tl.ReplyKeyboardMarkup(
+            rows=[tl.KeyboardButtonRow(buttons=text_buttons)], resize=True)
+    kb = url_buttons
     rows = []
     for i in range(0, len(kb), 4):
-        rows.append(tl.KeyboardButtonRow(buttons=kb[i:i + 4]))
-    return tl.ReplyInlineMarkup(rows=rows)
+        rows.append(tl.KeyboardInlineButtonRow(buttons=kb[i:i + 4]))
+    return tl.ReplyInlineMarkup(rows=rows, force_reply=False)
 
 
 async def cmd_send(client, args):
@@ -1019,11 +1046,21 @@ async def cmd_click(client, args):
             die("под %r несколько кнопок: %s — укажи номер" %
                 (sel, " / ".join(getattr(b, "text", "?") for b in hits)))
         btn = hits[0]
-    if isinstance(btn, tl.KeyboardButtonUrl):
-        warn("это url-кнопка, у неё нечего «нажимать»: %s" % btn.url)
+    typ = getattr(btn, "type", None)
+    if isinstance(typ, (tl.InlineButtonTypeUrl, tl.InlineButtonTypeWebView)):
+        warn("это url-кнопка, у неё нечего «нажимать»: %s" % typ.url)
         return
-    res = await msg.click(btn)
-    p(green("✓ нажата кнопка %r" % getattr(btn, "text", "?")))
+    if isinstance(typ, tl.InlineButtonTypeCallback):
+        from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
+        res = await client(GetBotCallbackAnswerRequest(
+            peer=ent, msg_id=msg.id, data=typ.data, game=False, password=None))
+        p(green("✓ нажата кнопка %r" % getattr(btn, "text", "?")))
+        if getattr(res, "message", None):
+            p(dim("ответ бота: %s" % res.message))
+        if getattr(res, "alert", False):
+            p(yellow("вопль/алерт от бота"))
+        return
+    die("кнопка неподдерживаемого типа: %s" % type(btn).__name__)
     if isinstance(res, tl.Message):
         p(dim("текст после нажатия: " + (res.message or "(пусто)")))
     p(green("✓ отправлено ") + dim("[%d] в %s" % (msg.id, entity_name(ent))))
@@ -1434,6 +1471,114 @@ async def cmd_intel(client, args):
             p("статус:      " + status_text(getattr(ent, "status", None)))
 
 
+# ───────────────────────────── web view ─────────────────────────────
+
+
+def _extract_webview_url(res):
+    """URL из WebViewResultUrl / Updates(UpdateWebView) / голой строки."""
+    if res is None:
+        return None
+    if isinstance(res, str):
+        return res
+    v = getattr(res, "url", None)
+    if isinstance(v, str) and v:
+        return v
+    for u in getattr(res, "updates", None) or []:
+        u2 = getattr(u, "url", None)
+        if isinstance(u2, str) and u2:
+            return u2
+    return None
+
+
+def _resolve_host(host, port):
+    import socket
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        warn("не удалось разрешить %s: %s" % (host, e))
+        return []
+    seen = []
+    for info in infos:
+        addr = info[4][0]
+        if addr not in seen:
+            seen.append(addr)
+    return seen
+
+
+async def cmd_webview(client, args):
+    """Webview-ссылка на миниапп/веб-апп бота без клиента Telegram."""
+    from telethon.tl.functions.messages import (
+        RequestMainWebViewRequest, RequestAppWebViewRequest, GetBotAppRequest)
+
+    ent = await resolve(client, args.bot)
+    if not getattr(ent, "bot", False):
+        die("%s — не бот" % args.bot)
+    peer = await client.get_input_entity(ent)
+    web = None
+    if args.short_name:
+        try:
+            app_info = await client(GetBotAppRequest(
+                app=tl.InputBotAppShortName(bot_id=ent, short_name=args.short_name),
+                hash=0))
+            if not isinstance(app_info, tl.BotApp):
+                die("бот вернул не-BotApp: %r" % (app_info,))
+            p("приложение: %s (id %d)" % (app_info.title, app_info.id))
+            p("описание:   %s" % app_info.description)
+            p("short_name: %s" % app_info.short_name)
+            p("")
+            web = await client(RequestAppWebViewRequest(
+                peer=peer, app=tl.InputBotAppShortName(bot_id=ent,
+                                                       short_name=args.short_name),
+                platform=args.platform, compact=args.compact,
+                fullscreen=args.fullscreen, start_param=args.start_param))
+        except RPCError as e:
+            die("app webview: %s" % e)
+    else:
+        try:
+            web = await client(RequestMainWebViewRequest(
+                peer=peer, bot=ent, platform=args.platform,
+                compact=args.compact, fullscreen=args.fullscreen,
+                start_param=args.start_param))
+        except RPCError as e:
+            die("main webview: %s" % e)
+
+    url = _extract_webview_url(web)
+    if not url:
+        warn("URL отдельно не достался; raw-ответ:")
+        p(repr(web))
+        return
+
+    from urllib.parse import urlsplit, parse_qsl, unquote_plus
+    sp = urlsplit(url)
+    host = sp.hostname or "?"
+    port = sp.port or (443 if sp.scheme == "https" else 80)
+
+    p(bold("Web view:"))
+    p("  бот:       {}".format(entity_name(ent)))
+    p("  хост:      {}:{}".format(host, port))
+    p("  URL:       {}".format(url))
+    tid = parse_qsl(sp.query, keep_blank_values=True) + parse_qsl(unquote_plus(sp.fragment), keep_blank_values=True)
+    for k, v in tid:
+        if k == "tgWebAppData":
+            # не разворачиваем — там весь auth-bundle; просто отмечаем
+            p("  auth:      токен tgWebAppData встроен в URL")
+        elif k in ("tgWebAppVersion", "tgWebAppPlatform", "tgWebAppFullscreen"):
+            p("  %s=%s" % (k, v))
+    ips = _resolve_host(host, port)
+    p("")
+    p(bold("IP хоста:"))
+    if ips:
+        for a in ips:
+            kind = "AAAA" if ":" in a else "A"
+            p("  %-8s %s" % (kind, a))
+    else:
+        p("  не разрешилось")
+    p("")
+    p(dim("открыть без клиента Telegram на этой машине:"))
+    p("  xdg-open %s" % url)
+    p(dim("или прокинь этот URL в свой браузер/webview-парсер; токен уже встроен."))
+
+
 # ───────────────────────────── argparse ─────────────────────────────
 
 def build_parser():
@@ -1478,6 +1623,18 @@ def build_parser():
     mf.add_argument("-u", "--until", metavar="WHEN", help="до указанной даты")
     mf.add_argument("-t", "--type", metavar="TYPE",
                     help="фото: photo, video, doc, voice, audio, gif, round, url, sticker")
+
+    # ---- web view
+    q = sub.add_parser("webview", aliases=["webapp", "miniapp-url"],
+                       help="URL web view миниаппа/веб-аппа бота (с токеном) + IP хоста")
+    q.add_argument("bot", help="бот: @username / id / часть_имени")
+    q.add_argument("short_name", nargs="?",
+                   help="short_name конкретного mini app (узнать: tgu webview @bot)")
+    q.add_argument("-p", "--platform", choices=["android", "ios", "web"],
+                   default="android", help="платформа, от имени которой запрашиваем")
+    q.add_argument("--start-param", help="параметр startapp")
+    q.add_argument("--compact", action="store_true", help="компактный режим")
+    q.add_argument("--fullscreen", action="store_true", help="во весь экран")
 
     # ---- разведка
     q = sub.add_parser("similar", help="поиск похожих юзеров/ботов/каналов по подстроке")
@@ -1629,6 +1786,8 @@ EXAMPLES = """
   tgu search встреча --chat Друзья            # найти 'встреча' в чате
   tgu search встреча --deep                   # во всех чатах
   tgu app @uvashenie_bot                      # инфа о миниаппе/вебаппе бота
+  tgu webview @uvashenie_bot                  # URL web view (с токеном) + IP хоста
+  tgu webview @uvashenie_bot -p ios           # спросить URL под iOS
   tgu similar uvashenie                       # найти похожих юзеров/ботов
   tgu estdate @uvashenie_bot                  # примерная дата регистрации по id
   tgu intel @uvashenie_bot                    # сводка: id, регистрация, флаги
@@ -1652,6 +1811,7 @@ ALIASES = {"ls": "chats", "r": "read", "s": "send", "msg": "send",
 
 FNS = {"me": cmd_me, "user": cmd_user, "contacts": cmd_contacts,
        "app": cmd_app, "similar": cmd_similar, "estdate": cmd_estdate,
+       "webview": cmd_webview,
        "intel": cmd_intel,
        "chats": cmd_chats, "read": cmd_read, "search": cmd_search,
        "send": cmd_send, "reply": cmd_reply, "edit": cmd_edit,
